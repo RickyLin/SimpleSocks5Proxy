@@ -16,6 +16,7 @@ public class UdpRelay : IDisposable
     private readonly ILogger _logger;
     private readonly UdpClient _udpClient;
     private readonly IPEndPoint _clientEndPoint;
+    private readonly FriendlyNameResolver _resolver;
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly Task _relayTask;
     private bool _disposed;
@@ -30,18 +31,24 @@ public class UdpRelay : IDisposable
     /// </summary>
     /// <param name="clientEndPoint">The client endpoint that will send UDP packets.</param>
     /// <param name="logger">The logger instance.</param>
-    public UdpRelay(IPEndPoint clientEndPoint, ILogger logger)
+    /// <param name="resolver">Friendly name resolver for log formatting.</param>
+    public UdpRelay(IPEndPoint clientEndPoint, ILogger logger, FriendlyNameResolver resolver)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _clientEndPoint = clientEndPoint ?? throw new ArgumentNullException(nameof(clientEndPoint));
+        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _cancellationTokenSource = new CancellationTokenSource();
 
         // Create UDP client and bind to any available port
         _udpClient = new UdpClient(0);
         LocalEndPoint = (IPEndPoint)_udpClient.Client.LocalEndPoint!;
 
-        _logger.Information("UDP relay started on {LocalEndPoint} for client {ClientEndPoint}",
-            LocalEndPoint, _clientEndPoint);
+        _logger.Information(
+            "UDP relay started on {LocalEndPoint}{FriendlyLocal} for client {ClientEndPoint}{FriendlyClient}",
+            LocalEndPoint,
+            _resolver.FriendlySuffix(LocalEndPoint),
+            _clientEndPoint,
+            _resolver.FriendlySuffix(_clientEndPoint));
 
         // Start the relay task
         _relayTask = RelayPacketsAsync(_cancellationTokenSource.Token);
@@ -85,17 +92,17 @@ public class UdpRelay : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.Error(ex, "Error in UDP relay for client {ClientEndPoint}", _clientEndPoint);
+                    _logger.Error(ex, "Error in UDP relay for client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
                 }
             }
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Fatal error in UDP relay for client {ClientEndPoint}", _clientEndPoint);
+            _logger.Error(ex, "Fatal error in UDP relay for client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
         }
         finally
         {
-            _logger.Information("UDP relay stopped for client {ClientEndPoint}", _clientEndPoint);
+            _logger.Information("UDP relay stopped for client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
         }
     }
 
@@ -112,7 +119,7 @@ public class UdpRelay : IDisposable
             // Format: RSV (2 bytes) | FRAG (1 byte) | ATYP (1 byte) | DST.ADDR | DST.PORT | DATA
             if (buffer.Length < 10) // Minimum header size
             {
-                _logger.Warning("Received UDP packet too small from client {ClientEndPoint}", _clientEndPoint);
+                _logger.Warning("Received UDP packet too small from client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
                 return;
             }
 
@@ -172,20 +179,31 @@ public class UdpRelay : IDisposable
                     }
                     catch (Exception ex)
                     {
-                        _logger.Warning(ex, "Failed to resolve domain {Domain} for UDP relay", domain);
+                        _logger.Warning(
+                            ex,
+                            "Failed to resolve domain {Domain} for UDP relay for client {ClientEndPoint}{FriendlyClient}",
+                            domain,
+                            _clientEndPoint,
+                            _resolver.FriendlySuffix(_clientEndPoint));
                         return;
                     }
                     break;
 
                 default:
-                    _logger.Warning("Unsupported address type {AddressType} in UDP packet from client {ClientEndPoint}", 
-                        addressType, _clientEndPoint);
+                    _logger.Warning(
+                        "Unsupported address type {AddressType} in UDP packet from client {ClientEndPoint}{FriendlyClient}",
+                        addressType,
+                        _clientEndPoint,
+                        _resolver.FriendlySuffix(_clientEndPoint));
                     return;
             }
 
             if (destinationEndPoint == null)
             {
-                _logger.Warning("Could not determine destination endpoint from UDP packet");
+                _logger.Warning(
+                    "Could not determine destination endpoint from UDP packet from client {ClientEndPoint}{FriendlyClient}",
+                    _clientEndPoint,
+                    _resolver.FriendlySuffix(_clientEndPoint));
                 return;
             }
 
@@ -197,12 +215,17 @@ public class UdpRelay : IDisposable
             // Forward to destination
             await _udpClient.SendAsync(payload, destinationEndPoint).ConfigureAwait(false);
             
-            _logger.Debug("Forwarded UDP packet from client {ClientEndPoint} to {DestinationEndPoint}, size: {Size}",
-                _clientEndPoint, destinationEndPoint, payloadLength);
+            _logger.Debug(
+                "Forwarded UDP packet from client {ClientEndPoint}{FriendlyClient} to {DestinationEndPoint}{FriendlyDest}, size: {Size}",
+                _clientEndPoint,
+                _resolver.FriendlySuffix(_clientEndPoint),
+                destinationEndPoint,
+                _resolver.FriendlySuffix(destinationEndPoint),
+                payloadLength);
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error handling client UDP packet from {ClientEndPoint}", _clientEndPoint);
+            _logger.Error(ex, "Error handling client UDP packet from {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
         }
     }
 
@@ -254,12 +277,17 @@ public class UdpRelay : IDisposable
             // Send back to client
             await _udpClient.SendAsync(responseBuffer, _clientEndPoint).ConfigureAwait(false);
             
-            _logger.Debug("Forwarded UDP response from {SourceEndPoint} to client {ClientEndPoint}, size: {Size}",
-                sourceEndPoint, _clientEndPoint, buffer.Length);
+            _logger.Debug(
+                "Forwarded UDP response from {SourceEndPoint}{FriendlySource} to client {ClientEndPoint}{FriendlyClient}, size: {Size}",
+                sourceEndPoint,
+                _resolver.FriendlySuffix(sourceEndPoint),
+                _clientEndPoint,
+                _resolver.FriendlySuffix(_clientEndPoint),
+                buffer.Length);
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error handling server UDP response from {SourceEndPoint}", sourceEndPoint);
+            _logger.Error(ex, "Error handling server UDP response from {SourceEndPoint}{FriendlySource}", sourceEndPoint, _resolver.FriendlySuffix(sourceEndPoint));
         }
     }
 

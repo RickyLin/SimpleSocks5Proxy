@@ -20,6 +20,7 @@ public class ConnectionHandler : IDisposable
     private readonly TcpClient _client;
     private readonly ILogger _logger;
     private readonly NetworkStream _clientStream;
+    private readonly FriendlyNameResolver _resolver;
     private TcpClient? _destinationClient;
     private NetworkStream? _destinationStream;
     private UdpRelay? _udpRelay;
@@ -30,10 +31,12 @@ public class ConnectionHandler : IDisposable
     /// </summary>
     /// <param name="client">The connected TCP client.</param>
     /// <param name="logger">The logger instance.</param>
-    public ConnectionHandler(TcpClient client, ILogger logger)
+    /// <param name="resolver">Friendly name resolver for log formatting.</param>
+    public ConnectionHandler(TcpClient client, ILogger logger, FriendlyNameResolver resolver)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _clientStream = _client.GetStream();
     }
 
@@ -43,23 +46,25 @@ public class ConnectionHandler : IDisposable
     /// <param name="cancellationToken">Cancellation token to stop processing.</param>
     public async Task HandleConnectionAsync(CancellationToken cancellationToken)
     {
-        var clientEndPoint = _client.Client.RemoteEndPoint?.ToString() ?? "Unknown";
+        var clientEpObj = _client.Client.RemoteEndPoint;
+        var clientEndPoint = clientEpObj?.ToString() ?? "Unknown";
+    var friendlyClientSuffix = _resolver.FriendlySuffix(clientEpObj);
         
         try
         {
-            _logger.Information("New client connection from {ClientEndPoint}", clientEndPoint);
+            _logger.Information("New client connection from {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
 
             // Step 1: SOCKS5 handshake
             if (!await PerformHandshakeAsync(cancellationToken).ConfigureAwait(false))
             {
-                _logger.Warning("Handshake failed for client {ClientEndPoint}", clientEndPoint);
+                _logger.Warning("Handshake failed for client {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
                 return;
             }
 
             // Step 2: Handle SOCKS5 request
             if (!await HandleSocks5RequestAsync(cancellationToken).ConfigureAwait(false))
             {
-                _logger.Warning("SOCKS5 request handling failed for client {ClientEndPoint}", clientEndPoint);
+                _logger.Warning("SOCKS5 request handling failed for client {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
                 return;
             }
 
@@ -76,11 +81,11 @@ public class ConnectionHandler : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error handling connection from {ClientEndPoint}", clientEndPoint);
+            _logger.Error(ex, "Error handling connection from {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
         }
         finally
         {
-            _logger.Information("Connection closed for client {ClientEndPoint}", clientEndPoint);
+            _logger.Information("Connection closed for client {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
         }
     }
 
@@ -289,7 +294,16 @@ public class ConnectionHandler : IDisposable
     {
         try
         {
-            _logger.Information("Connecting to {Address}:{Port}", address, port);
+            var clientEpObjForConnect = _client.Client.RemoteEndPoint;
+            var clientEndPointForConnect = clientEpObjForConnect?.ToString() ?? "Unknown";
+            var friendlyClientSuffixForConnect = _resolver.FriendlySuffix(clientEpObjForConnect);
+
+            _logger.Information(
+                "Connecting to {Address}{Friendly} for client {ClientEndPoint}{FriendlyClient}",
+                $"{address}:{port}",
+                _resolver.FriendlySuffixForAddressString(address),
+                clientEndPointForConnect,
+                friendlyClientSuffixForConnect);
 
             _destinationClient = new TcpClient();
             
@@ -300,7 +314,13 @@ public class ConnectionHandler : IDisposable
             }
             catch (SocketException ex)
             {
-                _logger.Warning(ex, "Failed to connect to {Address}:{Port}", address, port);
+                _logger.Warning(
+                    ex,
+                    "Failed to connect to {Address}{Friendly} for client {ClientEndPoint}{FriendlyClient}",
+                    $"{address}:{port}",
+                    _resolver.FriendlySuffixForAddressString(address),
+                    clientEndPointForConnect,
+                    friendlyClientSuffixForConnect);
                 
                 var replyCode = ex.SocketErrorCode switch
                 {
@@ -319,12 +339,28 @@ public class ConnectionHandler : IDisposable
             var localEndPoint = (IPEndPoint)_destinationClient.Client.LocalEndPoint!;
             await SendReplyAsync(Socks5Protocol.ReplyCode.Succeeded, localEndPoint, cancellationToken).ConfigureAwait(false);
             
-            _logger.Information("Successfully connected to {Address}:{Port}", address, port);
+            _logger.Information(
+                "Successfully connected to {Address}{Friendly} for client {ClientEndPoint}{FriendlyClient}",
+                $"{address}:{port}",
+                _resolver.FriendlySuffixForAddressString(address),
+                clientEndPointForConnect,
+                friendlyClientSuffixForConnect);
             return true;
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error handling CONNECT command to {Address}:{Port}", address, port);
+            // Recompute client endpoint defensively in catch
+            var clientEpObjForConnect = _client.Client.RemoteEndPoint;
+            var clientEndPointForConnect = clientEpObjForConnect?.ToString() ?? "Unknown";
+            var friendlyClientSuffixForConnect = _resolver.FriendlySuffix(clientEpObjForConnect);
+
+            _logger.Error(
+                ex,
+                "Error handling CONNECT command to {Address}{Friendly} for client {ClientEndPoint}{FriendlyClient}",
+                $"{address}:{port}",
+                _resolver.FriendlySuffixForAddressString(address),
+                clientEndPointForConnect,
+                friendlyClientSuffixForConnect);
             await SendReplyAsync(Socks5Protocol.ReplyCode.GeneralFailure, null, cancellationToken).ConfigureAwait(false);
             return false;
         }
@@ -342,12 +378,14 @@ public class ConnectionHandler : IDisposable
             _logger.Information("Setting up UDP ASSOCIATE");
 
             var clientEndPoint = (IPEndPoint)_client.Client.RemoteEndPoint!;
-            _udpRelay = new UdpRelay(clientEndPoint, _logger);
+            _udpRelay = new UdpRelay(clientEndPoint, _logger, _resolver);
 
             // Send success reply with UDP relay endpoint
             await SendReplyAsync(Socks5Protocol.ReplyCode.Succeeded, _udpRelay.LocalEndPoint, cancellationToken).ConfigureAwait(false);
             
-            _logger.Information("UDP ASSOCIATE setup completed, relay listening on {UdpEndPoint}", _udpRelay.LocalEndPoint);
+            _logger.Information("UDP ASSOCIATE setup completed, relay listening on {UdpEndPoint}{Friendly}",
+                _udpRelay.LocalEndPoint,
+                _resolver.FriendlySuffix(_udpRelay.LocalEndPoint));
             return true;
         }
         catch (Exception ex)

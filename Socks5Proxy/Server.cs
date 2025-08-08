@@ -16,6 +16,7 @@ public class Server : IDisposable
 {
     private readonly ProxyConfiguration _config;
     private readonly ILogger _logger;
+    private readonly FriendlyNameResolver _resolver;
     private TcpListener? _listener;
     private readonly List<ConnectionHandler> _activeConnections;
     private readonly object _connectionLock = new();
@@ -26,10 +27,12 @@ public class Server : IDisposable
     /// </summary>
     /// <param name="config">The proxy configuration.</param>
     /// <param name="logger">The logger instance.</param>
-    public Server(ProxyConfiguration config, ILogger logger)
+    /// <param name="resolver">The friendly name resolver.</param>
+    public Server(ProxyConfiguration config, ILogger logger, FriendlyNameResolver resolver)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _activeConnections = new List<ConnectionHandler>();
 
         // Validate configuration
@@ -37,6 +40,14 @@ public class Server : IDisposable
         {
             throw new ArgumentException($"Invalid proxy configuration: {errorMessage}", nameof(config));
         }
+    }
+
+    /// <summary>
+    /// Backward compatible constructor that creates a no-op resolver.
+    /// </summary>
+    public Server(ProxyConfiguration config, ILogger logger)
+        : this(config, logger, new FriendlyNameResolver(null, logger))
+    {
     }
 
     /// <summary>
@@ -56,7 +67,10 @@ public class Server : IDisposable
             _listener.Start();
 
             var localEndPoint = _listener.LocalEndpoint;
-            _logger.Information("SOCKS5 proxy server started on {LocalEndPoint}", localEndPoint);
+            _logger.Information(
+                "SOCKS5 proxy server started on {LocalEndPoint}{Friendly}",
+                localEndPoint,
+                _resolver.FriendlySuffix(localEndPoint));
 
             // Register cancellation callback to stop the listener
             using var registration = cancellationToken.Register(() =>
@@ -186,7 +200,9 @@ public class Server : IDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     private async Task HandleClientConnectionAsync(TcpClient tcpClient, CancellationToken cancellationToken)
     {
-        var clientEndPoint = tcpClient.Client.RemoteEndPoint?.ToString() ?? "Unknown";
+    var clientEndPointObj = tcpClient.Client.RemoteEndPoint;
+    var clientEndPoint = clientEndPointObj?.ToString() ?? "Unknown";
+    var friendlyClientSuffix = _resolver.FriendlySuffix(clientEndPointObj);
         ConnectionHandler? handler = null;
 
         try
@@ -196,7 +212,7 @@ public class Server : IDisposable
             tcpClient.SendTimeout = 30000;    // 30 seconds
             tcpClient.NoDelay = true;         // Disable Nagle's algorithm for better latency
 
-            handler = new ConnectionHandler(tcpClient, _logger);
+            handler = new ConnectionHandler(tcpClient, _logger, _resolver);
 
             // Add to active connections
             lock (_connectionLock)
@@ -204,15 +220,18 @@ public class Server : IDisposable
                 _activeConnections.Add(handler);
             }
 
-            _logger.Debug("Added connection handler for client {ClientEndPoint}, total active: {ActiveCount}", 
-                clientEndPoint, _activeConnections.Count);
+            _logger.Debug(
+                "Added connection handler for client {ClientEndPoint}{Friendly}, total active: {ActiveCount}",
+                clientEndPoint,
+                friendlyClientSuffix,
+                _activeConnections.Count);
 
             // Handle the connection
             await handler.HandleConnectionAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error handling client connection from {ClientEndPoint}", clientEndPoint);
+            _logger.Error(ex, "Error handling client connection from {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
         }
         finally
         {
@@ -233,8 +252,11 @@ public class Server : IDisposable
                     _logger.Error(ex, "Error disposing connection handler for {ClientEndPoint}", clientEndPoint);
                 }
 
-                _logger.Debug("Removed connection handler for client {ClientEndPoint}, total active: {ActiveCount}", 
-                    clientEndPoint, _activeConnections.Count);
+                _logger.Debug(
+                    "Removed connection handler for client {ClientEndPoint}{Friendly}, total active: {ActiveCount}",
+                    clientEndPoint,
+                    friendlyClientSuffix,
+                    _activeConnections.Count);
             }
 
             // Ensure client is properly closed
@@ -244,7 +266,7 @@ public class Server : IDisposable
             }
             catch (Exception ex)
             {
-                _logger.Debug(ex, "Error closing TCP client for {ClientEndPoint}", clientEndPoint);
+                _logger.Debug(ex, "Error closing TCP client for {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
             }
         }
     }

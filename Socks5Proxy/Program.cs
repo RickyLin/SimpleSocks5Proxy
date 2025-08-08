@@ -38,6 +38,9 @@ public class Program
                 return 1; // Error loading configuration
             }
 
+            // Create friendly name resolver (safe even if no mappings)
+            var resolver = new FriendlyNameResolver(proxyConfig.IPAddressMappings, logger);
+
             // Setup cancellation token for graceful shutdown
             using var cancellationTokenSource = new CancellationTokenSource();
             
@@ -50,7 +53,7 @@ public class Program
             };
 
             // Create and start the server
-            server = new Server(proxyConfig, logger);
+            server = new Server(proxyConfig, logger, resolver);
             
             logger.Information("Starting SOCKS5 proxy server on {Address}:{Port}", 
                 proxyConfig.ListenIPAddress, proxyConfig.ListenPort);

@@ -1,4 +1,10 @@
 {
   "ListenIPAddress": "127.0.0.1",
-  "ListenPort": 1080
+  "ListenPort": 1080,
+  "IPAddressMappings": [
+    {
+      "IPAddress": "127.0.0.1",
+      "FriendlyName": "LocalRicky"
+    }
+  ]
 }

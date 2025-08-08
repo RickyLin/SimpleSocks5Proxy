@@ -1,5 +1,6 @@
 using System.ComponentModel.DataAnnotations;
 using System.Net;
+using System.Collections.Generic;
 
 namespace Socks5Proxy;
 
@@ -19,6 +20,11 @@ public class ProxyConfiguration
     /// </summary>
     [Range(1, 65535, ErrorMessage = "ListenPort must be between 1 and 65535")]
     public int ListenPort { get; set; }
+
+    /// <summary>
+    /// Optional mappings of IP addresses to friendly names for log output.
+    /// </summary>
+    public List<IPAddressMapping> IPAddressMappings { get; set; } = new();
 
     /// <summary>
     /// Validates that the IP address is valid.
@@ -50,4 +56,13 @@ public class ProxyConfiguration
 
         return true;
     }
+}
+
+/// <summary>
+/// A single mapping from literal IP address to a friendly name for logging.
+/// </summary>
+public class IPAddressMapping
+{
+    public string IPAddress { get; set; } = string.Empty;
+    public string FriendlyName { get; set; } = string.Empty;
 }
