@@ -40,11 +40,11 @@ Add an optional “address book” that maps literal IPs to human‑friendly nam
 	 - Optional section. Missing/empty ⇒ feature disabled.
 
 2) Logging behavior
-	 - When logging an IP or endpoint that matches a configured mapping, render as:
-		 - Endpoint: `FriendlyName [IP:Port]`
-		 - Bare IP: `FriendlyName [IP]`
+	 - When logging an IP or endpoint that matches a configured mapping, append a friendly suffix in parentheses:
+		 - Endpoint: `IP:Port (FriendlyName)`
+		 - Bare IP: `IP (FriendlyName)`
 	 - When no mapping exists, render the original value unchanged.
-	 - Do not alter message templates’ property names (retain existing structured logging properties where possible; only the formatted value changes).
+	 - Do not alter message templates’ property names; the friendly text is appended as a separate parameter/suffix in logs.
 
 3) Scope of application
 	 - Apply to logs that include client or destination IPs/endpoints in:
@@ -83,16 +83,16 @@ Validation rules:
 
 ## Logging format details
 
-- Preferred rendering for endpoints: `{FriendlyName} [{IP}:{Port}]`.
-- Preferred rendering for IP-only: `{FriendlyName} [{IP}]`.
+- Preferred rendering for endpoints: `{IP}:{Port} (FriendlyName)`.
+- Preferred rendering for IP-only: `{IP} (FriendlyName)`.
 - For domain destinations (e.g., CONNECT to a hostname), do not attempt mapping; keep domain unchanged.
 - If an endpoint is unknown/null, preserve existing behavior (e.g., “Unknown”).
 
 Before/After examples:
 - Before: `New client connection from 192.168.1.10:51324`
-	After:  `New client connection from Laptop [192.168.1.10:51324]`
+	After:  `New client connection from 192.168.1.10:51324 (Laptop)`
 - Before: `Successfully connected to 93.184.216.34:443`
-	After:  `Successfully connected to ExampleEdge [93.184.216.34:443]` (when mapped)
+	After:  `Successfully connected to 93.184.216.34:443 (ExampleEdge)` (when mapped)
 - Before: `Connecting to example.org:80`
 	After:  unchanged (domains aren’t mapped)
 
@@ -118,7 +118,7 @@ Before/After examples:
 ## Acceptance criteria
 
 - With no `IPAddressMappings`, log output is byte-for-byte compatible with current behavior.
-- With mappings configured, any logged IP/endpoint that matches renders as `FriendlyName [IP[:Port]]`.
+- With mappings configured, any logged IP/endpoint that matches renders as `{IP[:Port]} (FriendlyName)`.
 - Startup logs include:
 	- Count of valid mappings loaded.
 	- A warning summarizing any invalid entries and duplicates.
@@ -128,7 +128,7 @@ Before/After examples:
 
 Unit tests (minimal):
 - Resolves IPv4 and IPv6 addresses to names; returns original when missing.
-- Formats endpoints as `Friendly [IP:Port]` and bare IPs as `Friendly [IP]`.
+- Appends friendly suffixes as ` (Friendly)` after IP or endpoint when mapped.
 - Handles duplicates (last wins) and logs a warning hook (can be asserted via testable logger).
 - Skips invalid `IPAddress` values and empty `FriendlyName` entries.
 

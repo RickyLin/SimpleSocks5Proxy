@@ -152,6 +152,29 @@ SimpleSocks5Proxy/
 └── Socks5Proxy.sln    # Solution file
 ```
 
+## Friendly name logging
+
+Optionally map specific IP addresses to human-friendly labels for clearer logs. When a mapping exists, logs append a suffix like ` (FriendlyName)` after the IP or endpoint.
+
+Example config (in `proxy.json`):
+
+```json
+{
+  "ListenIPAddress": "0.0.0.0",
+  "ListenPort": 1080,
+  "IPAddressMappings": [
+    { "IPAddress": "192.168.1.10", "FriendlyName": "Laptop" },
+    { "IPAddress": "10.0.0.5", "FriendlyName": "NAS" }
+  ]
+}
+```
+
+Log output:
+- Before: `New client connection from 192.168.1.10:51324`
+- After:  `New client connection from 192.168.1.10:51324 (Laptop)`
+
+If no mapping exists, the original value is logged unchanged. Domains (e.g., `example.org:80`) aren’t mapped.
+
 ## License
 
 This project is licensed under the terms specified in the LICENSE file.
