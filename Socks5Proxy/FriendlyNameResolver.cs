@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -14,15 +15,16 @@ namespace Socks5Proxy;
 public sealed class FriendlyNameResolver
 {
     private readonly ILogger _logger;
-    private readonly Dictionary<string, string> _map; // key: normalized IP string, value: FriendlyName
+    private readonly ImmutableDictionary<string, string> _map; // key: normalized IP string, value: FriendlyName
 
     public FriendlyNameResolver(IEnumerable<IPAddressMapping>? mappings, ILogger logger)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var builder = ImmutableDictionary.CreateBuilder<string, string>(StringComparer.OrdinalIgnoreCase);
 
         if (mappings == null)
         {
+            _map = builder.ToImmutable();
             return;
         }
 
@@ -46,12 +48,14 @@ public sealed class FriendlyNameResolver
             }
 
             var key = ip.ToString(); // normalized canonical
-            if (_map.ContainsKey(key))
+            if (builder.ContainsKey(key))
             {
                 duplicates.Add(key);
             }
-            _map[key] = name; // last one wins
+            builder[key] = name; // last one wins
         }
+
+        _map = builder.ToImmutable();
 
         if (invalidEntries.Count > 0)
         {

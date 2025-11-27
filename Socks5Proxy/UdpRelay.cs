@@ -1,4 +1,6 @@
 using System;
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -11,14 +13,17 @@ namespace Socks5Proxy;
 /// <summary>
 /// UDP relay handler for SOCKS5 UDP ASSOCIATE command.
 /// </summary>
-public class UdpRelay : IDisposable
+public class UdpRelay : IDisposable, IAsyncDisposable
 {
     private readonly ILogger _logger;
     private readonly UdpClient _udpClient;
-    private readonly IPEndPoint _clientEndPoint;
+    private readonly IPEndPoint _clientTcpEndPoint;
+    private IPEndPoint? _actualClientUdpEndPoint; // Track actual client UDP source
     private readonly FriendlyNameResolver _resolver;
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly Task _relayTask;
+    private readonly ConcurrentDictionary<string, (IPAddress[] Addresses, DateTime Expiry)> _dnsCache;
+    private static readonly TimeSpan DnsCacheTtl = TimeSpan.FromMinutes(5);
     private bool _disposed;
 
     /// <summary>
@@ -35,9 +40,10 @@ public class UdpRelay : IDisposable
     public UdpRelay(IPEndPoint clientEndPoint, ILogger logger, FriendlyNameResolver resolver)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _clientEndPoint = clientEndPoint ?? throw new ArgumentNullException(nameof(clientEndPoint));
+        _clientTcpEndPoint = clientEndPoint ?? throw new ArgumentNullException(nameof(clientEndPoint));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _cancellationTokenSource = new CancellationTokenSource();
+        _dnsCache = new ConcurrentDictionary<string, (IPAddress[] Addresses, DateTime Expiry)>(StringComparer.OrdinalIgnoreCase);
 
         // Create UDP client and bind to any available port
         _udpClient = new UdpClient(0);
@@ -47,8 +53,8 @@ public class UdpRelay : IDisposable
             "UDP relay started on {LocalEndPoint}{FriendlyLocal} for client {ClientEndPoint}{FriendlyClient}",
             LocalEndPoint,
             _resolver.FriendlySuffix(LocalEndPoint),
-            _clientEndPoint,
-            _resolver.FriendlySuffix(_clientEndPoint));
+            _clientTcpEndPoint,
+            _resolver.FriendlySuffix(_clientTcpEndPoint));
 
         // Start the relay task
         _relayTask = RelayPacketsAsync(_cancellationTokenSource.Token);
@@ -66,12 +72,26 @@ public class UdpRelay : IDisposable
             {
                 try
                 {
-                    var result = await _udpClient.ReceiveAsync().ConfigureAwait(false);
+                    // Use ReceiveAsync overload with CancellationToken (available in .NET 5+)
+                    var result = await _udpClient.ReceiveAsync(cancellationToken).ConfigureAwait(false);
                     
                     // Check if the packet is from our client
-                    if (result.RemoteEndPoint.Equals(_clientEndPoint))
+                    // Track the actual client UDP source on first packet (client may use different ephemeral port)
+                    // Validate by IP address only, as client may use different port than TCP connection
+                    if (_actualClientUdpEndPoint == null && result.RemoteEndPoint.Address.Equals(_clientTcpEndPoint.Address))
+                    {
+                        _actualClientUdpEndPoint = result.RemoteEndPoint;
+                        _logger.Debug("Tracked actual client UDP endpoint: {ActualEndPoint}", _actualClientUdpEndPoint);
+                    }
+
+                    if (_actualClientUdpEndPoint != null && result.RemoteEndPoint.Equals(_actualClientUdpEndPoint))
                     {
                         // Parse SOCKS5 UDP header and forward to destination
+                        await HandleClientPacketAsync(result.Buffer, cancellationToken).ConfigureAwait(false);
+                    }
+                    else if (result.RemoteEndPoint.Address.Equals(_clientTcpEndPoint.Address))
+                    {
+                        // Packet from client IP but different port than tracked - could be legitimate
                         await HandleClientPacketAsync(result.Buffer, cancellationToken).ConfigureAwait(false);
                     }
                     else
@@ -79,6 +99,11 @@ public class UdpRelay : IDisposable
                         // Forward response back to client with SOCKS5 UDP header
                         await HandleServerResponseAsync(result.Buffer, result.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Cancellation requested, exit gracefully
+                    break;
                 }
                 catch (ObjectDisposedException)
                 {
@@ -92,17 +117,17 @@ public class UdpRelay : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.Error(ex, "Error in UDP relay for client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
+                    _logger.Error(ex, "Error in UDP relay for client {ClientEndPoint}{FriendlyClient}", _clientTcpEndPoint, _resolver.FriendlySuffix(_clientTcpEndPoint));
                 }
             }
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Fatal error in UDP relay for client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
+            _logger.Error(ex, "Fatal error in UDP relay for client {ClientEndPoint}{FriendlyClient}", _clientTcpEndPoint, _resolver.FriendlySuffix(_clientTcpEndPoint));
         }
         finally
         {
-            _logger.Information("UDP relay stopped for client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
+            _logger.Information("UDP relay stopped for client {ClientEndPoint}{FriendlyClient}", _clientTcpEndPoint, _resolver.FriendlySuffix(_clientTcpEndPoint));
         }
     }
 
@@ -119,14 +144,26 @@ public class UdpRelay : IDisposable
             // Format: RSV (2 bytes) | FRAG (1 byte) | ATYP (1 byte) | DST.ADDR | DST.PORT | DATA
             if (buffer.Length < 10) // Minimum header size
             {
-                _logger.Warning("Received UDP packet too small from client {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
+                _logger.Warning("Received UDP packet too small from client {ClientEndPoint}{FriendlyClient}", _clientTcpEndPoint, _resolver.FriendlySuffix(_clientTcpEndPoint));
                 return;
             }
 
             int offset = 0;
             
-            // Skip RSV (2 bytes) and FRAG (1 byte)
-            offset += 3;
+            // Skip RSV (2 bytes)
+            offset += 2;
+            
+            // Validate FRAG field - fragmented packets are not supported
+            byte frag = buffer[offset++];
+            if (frag != 0)
+            {
+                _logger.Warning(
+                    "Received fragmented UDP packet (FRAG={Frag}) from client {ClientEndPoint}{FriendlyClient}, fragmentation not supported",
+                    frag,
+                    _clientTcpEndPoint,
+                    _resolver.FriendlySuffix(_clientTcpEndPoint));
+                return;
+            }
             
             byte addressType = buffer[offset++];
             IPEndPoint? destinationEndPoint = null;
@@ -166,10 +203,10 @@ public class UdpRelay : IDisposable
                     port = (buffer[offset] << 8) | buffer[offset + 1];
                     offset += 2;
                     
-                    // Resolve domain name
+                    // Resolve domain name with caching and cancellation support
                     try
                     {
-                        var addresses = await Dns.GetHostAddressesAsync(domain).ConfigureAwait(false);
+                        var addresses = await ResolveDnsWithCacheAsync(domain, cancellationToken).ConfigureAwait(false);
                         var targetAddress = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) 
                                           ?? addresses.FirstOrDefault();
                         if (targetAddress != null)
@@ -177,14 +214,18 @@ public class UdpRelay : IDisposable
                             destinationEndPoint = new IPEndPoint(targetAddress, port);
                         }
                     }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
                     catch (Exception ex)
                     {
                         _logger.Warning(
                             ex,
                             "Failed to resolve domain {Domain} for UDP relay for client {ClientEndPoint}{FriendlyClient}",
                             domain,
-                            _clientEndPoint,
-                            _resolver.FriendlySuffix(_clientEndPoint));
+                            _clientTcpEndPoint,
+                            _resolver.FriendlySuffix(_clientTcpEndPoint));
                         return;
                     }
                     break;
@@ -193,8 +234,8 @@ public class UdpRelay : IDisposable
                     _logger.Warning(
                         "Unsupported address type {AddressType} in UDP packet from client {ClientEndPoint}{FriendlyClient}",
                         addressType,
-                        _clientEndPoint,
-                        _resolver.FriendlySuffix(_clientEndPoint));
+                        _clientTcpEndPoint,
+                        _resolver.FriendlySuffix(_clientTcpEndPoint));
                     return;
             }
 
@@ -202,31 +243,45 @@ public class UdpRelay : IDisposable
             {
                 _logger.Warning(
                     "Could not determine destination endpoint from UDP packet from client {ClientEndPoint}{FriendlyClient}",
-                    _clientEndPoint,
-                    _resolver.FriendlySuffix(_clientEndPoint));
+                    _clientTcpEndPoint,
+                    _resolver.FriendlySuffix(_clientTcpEndPoint));
                 return;
             }
 
-            // Extract payload data
+            // Send payload directly using Memory<byte> to avoid array copy
             var payloadLength = buffer.Length - offset;
-            var payload = new byte[payloadLength];
-            Array.Copy(buffer, offset, payload, 0, payloadLength);
-
-            // Forward to destination
-            await _udpClient.SendAsync(payload, destinationEndPoint).ConfigureAwait(false);
+            await _udpClient.SendAsync(buffer.AsMemory(offset, payloadLength), destinationEndPoint, cancellationToken).ConfigureAwait(false);
             
             _logger.Debug(
                 "Forwarded UDP packet from client {ClientEndPoint}{FriendlyClient} to {DestinationEndPoint}{FriendlyDest}, size: {Size}",
-                _clientEndPoint,
-                _resolver.FriendlySuffix(_clientEndPoint),
+                _clientTcpEndPoint,
+                _resolver.FriendlySuffix(_clientTcpEndPoint),
                 destinationEndPoint,
                 _resolver.FriendlySuffix(destinationEndPoint),
                 payloadLength);
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error handling client UDP packet from {ClientEndPoint}{FriendlyClient}", _clientEndPoint, _resolver.FriendlySuffix(_clientEndPoint));
+            _logger.Error(ex, "Error handling client UDP packet from {ClientEndPoint}{FriendlyClient}", _clientTcpEndPoint, _resolver.FriendlySuffix(_clientTcpEndPoint));
         }
+    }
+
+    /// <summary>
+    /// Resolves DNS with caching to avoid repeated lookups.
+    /// </summary>
+    private async Task<IPAddress[]> ResolveDnsWithCacheAsync(string domain, CancellationToken cancellationToken)
+    {
+        // Check cache first
+        if (_dnsCache.TryGetValue(domain, out var cached) && cached.Expiry > DateTime.UtcNow)
+        {
+            return cached.Addresses;
+        }
+
+        // Resolve and cache
+        var addresses = await Dns.GetHostAddressesAsync(domain, cancellationToken).ConfigureAwait(false);
+        _dnsCache[domain] = (addresses, DateTime.UtcNow.Add(DnsCacheTtl));
+        
+        return addresses;
     }
 
     /// <summary>
@@ -237,11 +292,15 @@ public class UdpRelay : IDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     private async Task HandleServerResponseAsync(byte[] buffer, IPEndPoint sourceEndPoint, CancellationToken cancellationToken)
     {
+        // Determine actual client endpoint to send response to
+        var clientTarget = _actualClientUdpEndPoint ?? _clientTcpEndPoint;
+        
+        // Calculate header length: RSV(2) + FRAG(1) + ATYP(1) + ADDR(4 or 16) + PORT(2)
+        var headerLength = sourceEndPoint.AddressFamily == AddressFamily.InterNetwork ? 10 : 22;
+        var responseBuffer = ArrayPool<byte>.Shared.Rent(headerLength + buffer.Length);
+        
         try
         {
-            // Create SOCKS5 UDP header
-            var headerLength = sourceEndPoint.AddressFamily == AddressFamily.InterNetwork ? 10 : 22; // IPv4: 10, IPv6: 22
-            var responseBuffer = new byte[headerLength + buffer.Length];
             int offset = 0;
 
             // RSV (2 bytes)
@@ -273,21 +332,26 @@ public class UdpRelay : IDisposable
 
             // Payload
             Array.Copy(buffer, 0, responseBuffer, offset, buffer.Length);
+            var totalLength = offset + buffer.Length;
 
-            // Send back to client
-            await _udpClient.SendAsync(responseBuffer, _clientEndPoint).ConfigureAwait(false);
+            // Send back to client using Memory<byte>
+            await _udpClient.SendAsync(responseBuffer.AsMemory(0, totalLength), clientTarget, cancellationToken).ConfigureAwait(false);
             
             _logger.Debug(
                 "Forwarded UDP response from {SourceEndPoint}{FriendlySource} to client {ClientEndPoint}{FriendlyClient}, size: {Size}",
                 sourceEndPoint,
                 _resolver.FriendlySuffix(sourceEndPoint),
-                _clientEndPoint,
-                _resolver.FriendlySuffix(_clientEndPoint),
+                clientTarget,
+                _resolver.FriendlySuffix(clientTarget),
                 buffer.Length);
         }
         catch (Exception ex)
         {
             _logger.Error(ex, "Error handling server UDP response from {SourceEndPoint}{FriendlySource}", sourceEndPoint, _resolver.FriendlySuffix(sourceEndPoint));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(responseBuffer);
         }
     }
 
@@ -300,6 +364,17 @@ public class UdpRelay : IDisposable
 
         _cancellationTokenSource.Cancel();
         
+        // Dispose UDP client to unblock any pending ReceiveAsync
+        try
+        {
+            _udpClient?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug(ex, "Error disposing UDP client during stop");
+        }
+        
+        // Wait for relay task to complete
         try
         {
             await _relayTask.ConfigureAwait(false);
@@ -310,8 +385,23 @@ public class UdpRelay : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.Error(ex, "Error stopping UDP relay for client {ClientEndPoint}", _clientEndPoint);
+            _logger.Error(ex, "Error stopping UDP relay for client {ClientEndPoint}", _clientTcpEndPoint);
         }
+    }
+
+    /// <summary>
+    /// Asynchronously disposes the UDP relay resources.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        
+        _disposed = true;
+        
+        await StopAsync().ConfigureAwait(false);
+        _cancellationTokenSource.Dispose();
+        
+        GC.SuppressFinalize(this);
     }
 
     /// <summary>
@@ -323,8 +413,31 @@ public class UdpRelay : IDisposable
         
         _disposed = true;
         _cancellationTokenSource.Cancel();
-        _udpClient?.Dispose();
-        _cancellationTokenSource?.Dispose();
+        
+        // Dispose UDP client first to unblock ReceiveAsync
+        try
+        {
+            _udpClient?.Dispose();
+        }
+        catch
+        {
+            // Ignore disposal errors
+        }
+        
+        // Wait for relay task with timeout
+        try
+        {
+            if (!_relayTask.Wait(TimeSpan.FromSeconds(2)))
+            {
+                _logger.Warning("Relay task did not complete within timeout during disposal");
+            }
+        }
+        catch
+        {
+            // Ignore task completion errors during disposal
+        }
+        
+        _cancellationTokenSource.Dispose();
         
         GC.SuppressFinalize(this);
     }

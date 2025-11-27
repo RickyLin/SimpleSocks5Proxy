@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipelines;
@@ -15,7 +16,7 @@ namespace Socks5Proxy;
 /// <summary>
 /// Handles individual client connections for the SOCKS5 proxy server.
 /// </summary>
-public class ConnectionHandler : IDisposable
+public class ConnectionHandler : IDisposable, IAsyncDisposable
 {
     private readonly TcpClient _client;
     private readonly ILogger _logger;
@@ -96,16 +97,20 @@ public class ConnectionHandler : IDisposable
     /// <returns>True if handshake was successful, otherwise false.</returns>
     private async Task<bool> PerformHandshakeAsync(CancellationToken cancellationToken)
     {
+        var buffer = ArrayPool<byte>.Shared.Rent(255);
         try
         {
-            // Read client's method selection message
-            var buffer = new byte[255];
-            var bytesRead = await _clientStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-            
-            if (bytesRead < 3)
+            // Read client's method selection message - need at least 2 bytes for version and method count
+            var totalRead = 0;
+            while (totalRead < 2)
             {
-                _logger.Warning("Invalid handshake message length: {Length}", bytesRead);
-                return false;
+                var bytesRead = await _clientStream.ReadAsync(buffer, totalRead, 2 - totalRead, cancellationToken).ConfigureAwait(false);
+                if (bytesRead == 0)
+                {
+                    _logger.Warning("Connection closed during handshake");
+                    return false;
+                }
+                totalRead += bytesRead;
             }
 
             // Validate SOCKS version
@@ -116,10 +121,22 @@ public class ConnectionHandler : IDisposable
             }
 
             byte methodCount = buffer[1];
-            if (bytesRead < 2 + methodCount)
+            if (methodCount == 0)
             {
-                _logger.Warning("Incomplete handshake message");
+                _logger.Warning("No authentication methods provided");
                 return false;
+            }
+
+            // Read remaining method bytes
+            while (totalRead < 2 + methodCount)
+            {
+                var bytesRead = await _clientStream.ReadAsync(buffer, totalRead, 2 + methodCount - totalRead, cancellationToken).ConfigureAwait(false);
+                if (bytesRead == 0)
+                {
+                    _logger.Warning("Connection closed during handshake while reading methods");
+                    return false;
+                }
+                totalRead += bytesRead;
             }
 
             // Check if "No Authentication Required" method is supported
@@ -154,6 +171,10 @@ public class ConnectionHandler : IDisposable
             _logger.Error(ex, "Error during handshake");
             return false;
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     /// <summary>
@@ -163,16 +184,20 @@ public class ConnectionHandler : IDisposable
     /// <returns>True if request was handled successfully, otherwise false.</returns>
     private async Task<bool> HandleSocks5RequestAsync(CancellationToken cancellationToken)
     {
+        var buffer = ArrayPool<byte>.Shared.Rent(4);
         try
         {
-            // Read SOCKS5 request
-            var buffer = new byte[262]; // Max domain name length + header
-            var bytesRead = await _clientStream.ReadAsync(buffer, 0, 4, cancellationToken).ConfigureAwait(false);
-            
-            if (bytesRead != 4)
+            // Read SOCKS5 request header (4 bytes) with proper short-read handling
+            var totalRead = 0;
+            while (totalRead < 4)
             {
-                await SendReplyAsync(Socks5Protocol.ReplyCode.GeneralFailure, null, cancellationToken).ConfigureAwait(false);
-                return false;
+                var bytesRead = await _clientStream.ReadAsync(buffer, totalRead, 4 - totalRead, cancellationToken).ConfigureAwait(false);
+                if (bytesRead == 0)
+                {
+                    await SendReplyAsync(Socks5Protocol.ReplyCode.GeneralFailure, null, cancellationToken).ConfigureAwait(false);
+                    return false;
+                }
+                totalRead += bytesRead;
             }
 
             // Validate request format
@@ -184,6 +209,10 @@ public class ConnectionHandler : IDisposable
 
             byte command = buffer[1];
             byte addressType = buffer[3];
+
+            // Return buffer early since we don't need it anymore
+            ArrayPool<byte>.Shared.Return(buffer);
+            buffer = null!;
 
             // Parse destination address and port
             var (address, port, parseResult) = await ParseDestinationAsync(addressType, cancellationToken).ConfigureAwait(false);
@@ -209,6 +238,27 @@ public class ConnectionHandler : IDisposable
             await SendReplyAsync(Socks5Protocol.ReplyCode.GeneralFailure, null, cancellationToken).ConfigureAwait(false);
             return false;
         }
+        finally
+        {
+            if (buffer != null)
+                ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>
+    /// Reads exact number of bytes from stream, handling short reads.
+    /// </summary>
+    private async Task<bool> ReadExactAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        var totalRead = 0;
+        while (totalRead < count)
+        {
+            var bytesRead = await _clientStream.ReadAsync(buffer, offset + totalRead, count - totalRead, cancellationToken).ConfigureAwait(false);
+            if (bytesRead == 0)
+                return false;
+            totalRead += bytesRead;
+        }
+        return true;
     }
 
     /// <summary>
@@ -219,15 +269,15 @@ public class ConnectionHandler : IDisposable
     /// <returns>Tuple containing the address, port, and result code.</returns>
     private async Task<(string? address, int port, byte resultCode)> ParseDestinationAsync(byte addressType, CancellationToken cancellationToken)
     {
+        byte[]? buffer = null;
         try
         {
             switch (addressType)
             {
                 case Socks5Protocol.AddressType.IPv4:
                     {
-                        var buffer = new byte[6]; // 4 bytes IP + 2 bytes port
-                        var bytesRead = await _clientStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-                        if (bytesRead != 6)
+                        buffer = ArrayPool<byte>.Shared.Rent(6); // 4 bytes IP + 2 bytes port
+                        if (!await ReadExactAsync(buffer, 0, 6, cancellationToken).ConfigureAwait(false))
                             return (null, 0, Socks5Protocol.ReplyCode.GeneralFailure);
 
                         var ipBytes = new byte[4];
@@ -240,9 +290,8 @@ public class ConnectionHandler : IDisposable
 
                 case Socks5Protocol.AddressType.IPv6:
                     {
-                        var buffer = new byte[18]; // 16 bytes IP + 2 bytes port
-                        var bytesRead = await _clientStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-                        if (bytesRead != 18)
+                        buffer = ArrayPool<byte>.Shared.Rent(18); // 16 bytes IP + 2 bytes port
+                        if (!await ReadExactAsync(buffer, 0, 18, cancellationToken).ConfigureAwait(false))
                             return (null, 0, Socks5Protocol.ReplyCode.GeneralFailure);
 
                         var ipBytes = new byte[16];
@@ -255,15 +304,15 @@ public class ConnectionHandler : IDisposable
 
                 case Socks5Protocol.AddressType.DomainName:
                     {
-                        var lengthBuffer = new byte[1];
-                        var bytesRead = await _clientStream.ReadAsync(lengthBuffer, 0, 1, cancellationToken).ConfigureAwait(false);
-                        if (bytesRead != 1)
+                        buffer = ArrayPool<byte>.Shared.Rent(1);
+                        if (!await ReadExactAsync(buffer, 0, 1, cancellationToken).ConfigureAwait(false))
                             return (null, 0, Socks5Protocol.ReplyCode.GeneralFailure);
 
-                        byte domainLength = lengthBuffer[0];
-                        var buffer = new byte[domainLength + 2]; // domain + 2 bytes port
-                        bytesRead = await _clientStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-                        if (bytesRead != buffer.Length)
+                        byte domainLength = buffer[0];
+                        ArrayPool<byte>.Shared.Return(buffer);
+                        
+                        buffer = ArrayPool<byte>.Shared.Rent(domainLength + 2); // domain + 2 bytes port
+                        if (!await ReadExactAsync(buffer, 0, domainLength + 2, cancellationToken).ConfigureAwait(false))
                             return (null, 0, Socks5Protocol.ReplyCode.GeneralFailure);
 
                         var domain = Encoding.ASCII.GetString(buffer, 0, domainLength);
@@ -280,6 +329,11 @@ public class ConnectionHandler : IDisposable
         {
             _logger.Error(ex, "Error parsing destination address");
             return (null, 0, Socks5Protocol.ReplyCode.GeneralFailure);
+        }
+        finally
+        {
+            if (buffer != null)
+                ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -335,8 +389,14 @@ public class ConnectionHandler : IDisposable
                 return false;
             }
 
-            // Send success reply
-            var localEndPoint = (IPEndPoint)_destinationClient.Client.LocalEndPoint!;
+            // Send success reply - add null check for LocalEndPoint
+            var localEndPointObj = _destinationClient.Client.LocalEndPoint;
+            if (localEndPointObj is not IPEndPoint localEndPoint)
+            {
+                _logger.Warning("LocalEndPoint is null or not IPEndPoint after successful connection");
+                await SendReplyAsync(Socks5Protocol.ReplyCode.GeneralFailure, null, cancellationToken).ConfigureAwait(false);
+                return false;
+            }
             await SendReplyAsync(Socks5Protocol.ReplyCode.Succeeded, localEndPoint, cancellationToken).ConfigureAwait(false);
             
             _logger.Information(
@@ -416,44 +476,56 @@ public class ConnectionHandler : IDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     private async Task SendReplyAsync(byte replyCode, IPEndPoint? boundEndPoint = null, CancellationToken cancellationToken = default)
     {
+        // Max response size: 1 (ver) + 1 (rep) + 1 (rsv) + 1 (atyp) + 16 (IPv6) + 2 (port) = 22 bytes
+        var buffer = ArrayPool<byte>.Shared.Rent(22);
         try
         {
-            var response = new List<byte>
-            {
-                Socks5Protocol.Version,
-                replyCode,
-                Socks5Protocol.Reserved
-            };
+            int offset = 0;
+            buffer[offset++] = Socks5Protocol.Version;
+            buffer[offset++] = replyCode;
+            buffer[offset++] = Socks5Protocol.Reserved;
 
             if (boundEndPoint == null)
             {
                 // Use IPv4 zero address if no bound endpoint provided
-                response.Add(Socks5Protocol.AddressType.IPv4);
-                response.AddRange(new byte[] { 0, 0, 0, 0 }); // 0.0.0.0
-                response.AddRange(new byte[] { 0, 0 }); // Port 0
+                buffer[offset++] = Socks5Protocol.AddressType.IPv4;
+                buffer[offset++] = 0; // 0.0.0.0
+                buffer[offset++] = 0;
+                buffer[offset++] = 0;
+                buffer[offset++] = 0;
+                buffer[offset++] = 0; // Port 0
+                buffer[offset++] = 0;
             }
             else
             {
                 if (boundEndPoint.AddressFamily == AddressFamily.InterNetwork)
                 {
-                    response.Add(Socks5Protocol.AddressType.IPv4);
-                    response.AddRange(boundEndPoint.Address.GetAddressBytes());
+                    buffer[offset++] = Socks5Protocol.AddressType.IPv4;
+                    var addressBytes = boundEndPoint.Address.GetAddressBytes();
+                    Array.Copy(addressBytes, 0, buffer, offset, 4);
+                    offset += 4;
                 }
                 else if (boundEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                 {
-                    response.Add(Socks5Protocol.AddressType.IPv6);
-                    response.AddRange(boundEndPoint.Address.GetAddressBytes());
+                    buffer[offset++] = Socks5Protocol.AddressType.IPv6;
+                    var addressBytes = boundEndPoint.Address.GetAddressBytes();
+                    Array.Copy(addressBytes, 0, buffer, offset, 16);
+                    offset += 16;
                 }
 
-                response.Add((byte)(boundEndPoint.Port >> 8));
-                response.Add((byte)(boundEndPoint.Port & 0xFF));
+                buffer[offset++] = (byte)(boundEndPoint.Port >> 8);
+                buffer[offset++] = (byte)(boundEndPoint.Port & 0xFF);
             }
 
-            await _clientStream.WriteAsync(response.ToArray(), 0, response.Count, cancellationToken).ConfigureAwait(false);
+            await _clientStream.WriteAsync(buffer, 0, offset, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.Error(ex, "Error sending SOCKS5 reply");
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
@@ -466,25 +538,53 @@ public class ConnectionHandler : IDisposable
         if (_destinationStream == null)
             return;
 
+        // Create a linked cancellation token to coordinate shutdown when one direction fails
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var linkedToken = linkedCts.Token;
+
         try
         {
             _logger.Debug("Starting data forwarding");
 
+            // Configure pipe options for better network I/O performance
+            var pipeOptions = new PipeOptions(
+                pool: MemoryPool<byte>.Shared,
+                minimumSegmentSize: 4096,
+                pauseWriterThreshold: 64 * 1024,
+                resumeWriterThreshold: 32 * 1024);
+
             // Create pipes for bidirectional data flow
-            var clientToDestinationPipe = new Pipe();
-            var destinationToClientPipe = new Pipe();
+            var clientToDestinationPipe = new Pipe(pipeOptions);
+            var destinationToClientPipe = new Pipe(pipeOptions);
 
             // Start forwarding tasks
             var tasks = new[]
             {
-                ForwardStreamToPipeAsync(_clientStream, clientToDestinationPipe.Writer, "Client->Destination", cancellationToken),
-                ForwardPipeToStreamAsync(clientToDestinationPipe.Reader, _destinationStream, "Client->Destination", cancellationToken),
-                ForwardStreamToPipeAsync(_destinationStream, destinationToClientPipe.Writer, "Destination->Client", cancellationToken),
-                ForwardPipeToStreamAsync(destinationToClientPipe.Reader, _clientStream, "Destination->Client", cancellationToken)
+                ForwardStreamToPipeAsync(_clientStream, clientToDestinationPipe.Writer, "Client->Destination", linkedToken),
+                ForwardPipeToStreamAsync(clientToDestinationPipe.Reader, _destinationStream, "Client->Destination", linkedToken),
+                ForwardStreamToPipeAsync(_destinationStream, destinationToClientPipe.Writer, "Destination->Client", linkedToken),
+                ForwardPipeToStreamAsync(destinationToClientPipe.Reader, _clientStream, "Destination->Client", linkedToken)
             };
 
             // Wait for any task to complete (indicating one side closed)
             await Task.WhenAny(tasks).ConfigureAwait(false);
+            
+            // Cancel remaining tasks to ensure clean shutdown
+            linkedCts.Cancel();
+
+            // Wait for all tasks to complete with a timeout to ensure proper cleanup
+            try
+            {
+                await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when tasks are cancelled
+            }
+            catch (TimeoutException)
+            {
+                _logger.Warning("Timeout waiting for forwarding tasks to complete");
+            }
             
             _logger.Debug("Data forwarding completed");
         }
@@ -593,6 +693,44 @@ public class ConnectionHandler : IDisposable
     }
 
     /// <summary>
+    /// Asynchronously disposes the connection handler and all associated resources.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+
+        try
+        {
+            if (_udpRelay != null)
+            {
+                await _udpRelay.StopAsync().ConfigureAwait(false);
+                _udpRelay.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Error stopping UDP relay during async disposal");
+        }
+
+        try
+        {
+            _destinationStream?.Dispose();
+            _destinationClient?.Close();
+            // Note: _clientStream is owned by _client, disposing _client will dispose the stream
+            _client?.Close();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Error disposing connection resources during async disposal");
+        }
+
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>
     /// Disposes the connection handler and all associated resources.
     /// </summary>
     public void Dispose()
@@ -604,7 +742,8 @@ public class ConnectionHandler : IDisposable
 
         try
         {
-            _udpRelay?.StopAsync().Wait(TimeSpan.FromSeconds(5));
+            // Use GetAwaiter().GetResult() for cleaner exception handling
+            _udpRelay?.StopAsync().GetAwaiter().GetResult();
             _udpRelay?.Dispose();
         }
         catch (Exception ex)
@@ -616,7 +755,7 @@ public class ConnectionHandler : IDisposable
         {
             _destinationStream?.Dispose();
             _destinationClient?.Close();
-            _clientStream?.Dispose();
+            // Note: _clientStream is owned by _client, disposing _client will dispose the stream
             _client?.Close();
         }
         catch (Exception ex)

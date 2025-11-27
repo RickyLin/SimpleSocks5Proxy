@@ -109,6 +109,19 @@ public class Program
             proxyConfigPath = args[1];
         }
 
+        // Check if proxy configuration file exists and provide friendly error message
+        var fullProxyConfigPath = Path.IsPathRooted(proxyConfigPath) 
+            ? proxyConfigPath 
+            : Path.Combine(Directory.GetCurrentDirectory(), proxyConfigPath);
+            
+        if (!File.Exists(fullProxyConfigPath))
+        {
+            throw new FileNotFoundException(
+                $"Proxy configuration file not found: '{fullProxyConfigPath}'. " +
+                $"Please create the configuration file or specify a valid path using --config <path>.",
+                fullProxyConfigPath);
+        }
+
         // Add proxy configuration file
         builder.AddJsonFile(proxyConfigPath, optional: false, reloadOnChange: false);
 

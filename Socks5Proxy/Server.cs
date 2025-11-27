@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -12,14 +13,14 @@ namespace Socks5Proxy;
 /// <summary>
 /// SOCKS5 proxy server that handles incoming client connections.
 /// </summary>
-public class Server : IDisposable
+public class Server : IDisposable, IAsyncDisposable
 {
     private readonly ProxyConfiguration _config;
     private readonly ILogger _logger;
     private readonly FriendlyNameResolver _resolver;
     private TcpListener? _listener;
-    private readonly List<ConnectionHandler> _activeConnections;
-    private readonly object _connectionLock = new();
+    private readonly ConcurrentDictionary<int, ConnectionHandler> _activeConnections;
+    private int _connectionIdCounter;
     private bool _disposed;
 
     /// <summary>
@@ -33,7 +34,7 @@ public class Server : IDisposable
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
-        _activeConnections = new List<ConnectionHandler>();
+        _activeConnections = new ConcurrentDictionary<int, ConnectionHandler>();
 
         // Validate configuration
         if (!_config.IsValid(out string errorMessage))
@@ -175,7 +176,22 @@ public class Server : IDisposable
             }
             else
             {
-                // Cancellation was requested
+                // Cancellation was requested - handle orphaned accept task
+                // The acceptTask may still complete and return a TcpClient that needs to be disposed
+                _ = acceptTask.ContinueWith(t =>
+                {
+                    if (t.IsCompletedSuccessfully)
+                    {
+                        try
+                        {
+                            t.Result?.Dispose();
+                        }
+                        catch
+                        {
+                            // Ignore disposal errors during shutdown
+                        }
+                    }
+                }, TaskContinuationOptions.OnlyOnRanToCompletion);
                 return null;
             }
         }
@@ -200,10 +216,11 @@ public class Server : IDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     private async Task HandleClientConnectionAsync(TcpClient tcpClient, CancellationToken cancellationToken)
     {
-    var clientEndPointObj = tcpClient.Client.RemoteEndPoint;
-    var clientEndPoint = clientEndPointObj?.ToString() ?? "Unknown";
-    var friendlyClientSuffix = _resolver.FriendlySuffix(clientEndPointObj);
+        var clientEndPointObj = tcpClient.Client.RemoteEndPoint;
+        var clientEndPoint = clientEndPointObj?.ToString() ?? "Unknown";
+        var friendlyClientSuffix = _resolver.FriendlySuffix(clientEndPointObj);
         ConnectionHandler? handler = null;
+        var connectionId = Interlocked.Increment(ref _connectionIdCounter);
 
         try
         {
@@ -214,11 +231,8 @@ public class Server : IDisposable
 
             handler = new ConnectionHandler(tcpClient, _logger, _resolver);
 
-            // Add to active connections
-            lock (_connectionLock)
-            {
-                _activeConnections.Add(handler);
-            }
+            // Add to active connections using ConcurrentDictionary
+            _activeConnections.TryAdd(connectionId, handler);
 
             _logger.Debug(
                 "Added connection handler for client {ClientEndPoint}{Friendly}, total active: {ActiveCount}",
@@ -238,10 +252,7 @@ public class Server : IDisposable
             // Remove from active connections and dispose
             if (handler != null)
             {
-                lock (_connectionLock)
-                {
-                    _activeConnections.Remove(handler);
-                }
+                _activeConnections.TryRemove(connectionId, out _);
 
                 try
                 {
@@ -284,13 +295,9 @@ public class Server : IDisposable
             // Stop accepting new connections
             _listener?.Stop();
 
-            // Close all active connections
-            List<ConnectionHandler> connectionsToClose;
-            lock (_connectionLock)
-            {
-                connectionsToClose = new List<ConnectionHandler>(_activeConnections);
-                _activeConnections.Clear();
-            }
+            // Close all active connections - snapshot and clear using ConcurrentDictionary
+            var connectionsToClose = _activeConnections.Values.ToList();
+            _activeConnections.Clear();
 
             _logger.Information("Closing {Count} active connections", connectionsToClose.Count);
 
@@ -328,15 +335,28 @@ public class Server : IDisposable
     /// <summary>
     /// Gets the current number of active connections.
     /// </summary>
-    public int ActiveConnectionCount
+    public int ActiveConnectionCount => _activeConnections.Count;
+
+    /// <summary>
+    /// Asynchronously disposes the server and all its resources.
+    /// </summary>
+    public async ValueTask DisposeAsync()
     {
-        get
+        if (_disposed)
+            return;
+
+        _disposed = true;
+
+        try
         {
-            lock (_connectionLock)
-            {
-                return _activeConnections.Count;
-            }
+            await StopAsync().ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Error during async disposal");
+        }
+
+        GC.SuppressFinalize(this);
     }
 
     /// <summary>
@@ -351,7 +371,8 @@ public class Server : IDisposable
 
         try
         {
-            StopAsync().Wait(TimeSpan.FromSeconds(15));
+            // Use GetAwaiter().GetResult() instead of Wait() to avoid wrapping exceptions
+            StopAsync().GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
