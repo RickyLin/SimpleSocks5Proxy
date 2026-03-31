@@ -25,7 +25,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
     private TcpClient? _destinationClient;
     private NetworkStream? _destinationStream;
     private UdpRelay? _udpRelay;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Initializes a new instance of the ConnectionHandler class.
@@ -55,15 +55,19 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
         {
             _logger.Information("New client connection from {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
 
+            // Use a timeout for the handshake and request phases to prevent slowloris attacks
+            using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            handshakeCts.CancelAfter(TimeSpan.FromSeconds(30));
+
             // Step 1: SOCKS5 handshake
-            if (!await PerformHandshakeAsync(cancellationToken).ConfigureAwait(false))
+            if (!await PerformHandshakeAsync(handshakeCts.Token).ConfigureAwait(false))
             {
                 _logger.Warning("Handshake failed for client {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
                 return;
             }
 
             // Step 2: Handle SOCKS5 request
-            if (!await HandleSocks5RequestAsync(cancellationToken).ConfigureAwait(false))
+            if (!await HandleSocks5RequestAsync(handshakeCts.Token).ConfigureAwait(false))
             {
                 _logger.Warning("SOCKS5 request handling failed for client {ClientEndPoint}{Friendly}", clientEndPoint, friendlyClientSuffix);
                 return;
@@ -104,7 +108,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
             var totalRead = 0;
             while (totalRead < 2)
             {
-                var bytesRead = await _clientStream.ReadAsync(buffer, totalRead, 2 - totalRead, cancellationToken).ConfigureAwait(false);
+                var bytesRead = await _clientStream.ReadAsync(buffer.AsMemory(totalRead, 2 - totalRead), cancellationToken).ConfigureAwait(false);
                 if (bytesRead == 0)
                 {
                     _logger.Warning("Connection closed during handshake");
@@ -130,7 +134,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
             // Read remaining method bytes
             while (totalRead < 2 + methodCount)
             {
-                var bytesRead = await _clientStream.ReadAsync(buffer, totalRead, 2 + methodCount - totalRead, cancellationToken).ConfigureAwait(false);
+                var bytesRead = await _clientStream.ReadAsync(buffer.AsMemory(totalRead, 2 + methodCount - totalRead), cancellationToken).ConfigureAwait(false);
                 if (bytesRead == 0)
                 {
                     _logger.Warning("Connection closed during handshake while reading methods");
@@ -150,12 +154,11 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
                 }
             }
 
-            // Send method selection response
-            var response = new byte[2];
-            response[0] = Socks5Protocol.Version;
-            response[1] = noAuthSupported ? Socks5Protocol.AuthMethod.NoAuth : Socks5Protocol.AuthMethod.NoAcceptableMethods;
+            // Send method selection response (reuse rented buffer to avoid allocation)
+            buffer[0] = Socks5Protocol.Version;
+            buffer[1] = noAuthSupported ? Socks5Protocol.AuthMethod.NoAuth : Socks5Protocol.AuthMethod.NoAcceptableMethods;
 
-            await _clientStream.WriteAsync(response, 0, response.Length, cancellationToken).ConfigureAwait(false);
+            await _clientStream.WriteAsync(buffer.AsMemory(0, 2), cancellationToken).ConfigureAwait(false);
 
             if (!noAuthSupported)
             {
@@ -191,7 +194,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
             var totalRead = 0;
             while (totalRead < 4)
             {
-                var bytesRead = await _clientStream.ReadAsync(buffer, totalRead, 4 - totalRead, cancellationToken).ConfigureAwait(false);
+                var bytesRead = await _clientStream.ReadAsync(buffer.AsMemory(totalRead, 4 - totalRead), cancellationToken).ConfigureAwait(false);
                 if (bytesRead == 0)
                 {
                     await SendReplyAsync(Socks5Protocol.ReplyCode.GeneralFailure, null, cancellationToken).ConfigureAwait(false);
@@ -253,7 +256,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
         var totalRead = 0;
         while (totalRead < count)
         {
-            var bytesRead = await _clientStream.ReadAsync(buffer, offset + totalRead, count - totalRead, cancellationToken).ConfigureAwait(false);
+            var bytesRead = await _clientStream.ReadAsync(buffer.AsMemory(offset + totalRead, count - totalRead), cancellationToken).ConfigureAwait(false);
             if (bytesRead == 0)
                 return false;
             totalRead += bytesRead;
@@ -363,8 +366,21 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
             
             try
             {
-                await _destinationClient.ConnectAsync(address, port, cancellationToken).ConfigureAwait(false);
+                using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                connectCts.CancelAfter(TimeSpan.FromSeconds(15));
+                await _destinationClient.ConnectAsync(address, port, connectCts.Token).ConfigureAwait(false);
                 _destinationStream = _destinationClient.GetStream();
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                _logger.Warning(
+                    "Connection timed out to {Address}{Friendly} for client {ClientEndPoint}{FriendlyClient}",
+                    $"{address}:{port}",
+                    _resolver.FriendlySuffixForAddressString(address),
+                    clientEndPointForConnect,
+                    friendlyClientSuffixForConnect);
+                await SendReplyAsync(Socks5Protocol.ReplyCode.TtlExpired, null, cancellationToken).ConfigureAwait(false);
+                return false;
             }
             catch (SocketException ex)
             {
@@ -517,7 +533,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
                 buffer[offset++] = (byte)(boundEndPoint.Port & 0xFF);
             }
 
-            await _clientStream.WriteAsync(buffer, 0, offset, cancellationToken).ConfigureAwait(false);
+            await _clientStream.WriteAsync(buffer.AsMemory(0, offset), cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -649,9 +665,16 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
                 if (buffer.IsEmpty && result.IsCompleted)
                     break;
 
-                foreach (var segment in buffer)
+                if (buffer.IsSingleSegment)
                 {
-                    await stream.WriteAsync(segment, cancellationToken).ConfigureAwait(false);
+                    await stream.WriteAsync(buffer.First, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    foreach (var segment in buffer)
+                    {
+                        await stream.WriteAsync(segment, cancellationToken).ConfigureAwait(false);
+                    }
                 }
 
                 reader.AdvanceTo(buffer.End);
@@ -676,12 +699,12 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
     /// <param name="cancellationToken">Cancellation token.</param>
     private async Task WaitForClientDisconnectionAsync(CancellationToken cancellationToken)
     {
+        var buffer = ArrayPool<byte>.Shared.Rent(1);
         try
         {
-            var buffer = new byte[1];
             while (!cancellationToken.IsCancellationRequested && _client.Connected)
             {
-                var bytesRead = await _clientStream.ReadAsync(buffer, 0, 1, cancellationToken).ConfigureAwait(false);
+                var bytesRead = await _clientStream.ReadAsync(buffer.AsMemory(0, 1), cancellationToken).ConfigureAwait(false);
                 if (bytesRead == 0)
                     break; // Client disconnected
             }
@@ -690,6 +713,10 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
         {
             _logger.Debug(ex, "Client disconnection detected");
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     /// <summary>
@@ -697,10 +724,8 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return;
-
-        _disposed = true;
 
         try
         {
@@ -735,10 +760,8 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return;
-
-        _disposed = true;
 
         try
         {

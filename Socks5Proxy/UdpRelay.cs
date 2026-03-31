@@ -24,7 +24,8 @@ public class UdpRelay : IDisposable, IAsyncDisposable
     private readonly Task _relayTask;
     private readonly ConcurrentDictionary<string, (IPAddress[] Addresses, DateTime Expiry)> _dnsCache;
     private static readonly TimeSpan DnsCacheTtl = TimeSpan.FromMinutes(5);
-    private bool _disposed;
+    private static readonly int DnsCacheMaxSize = 100;
+    private int _disposed;
 
     /// <summary>
     /// Gets the local endpoint where the UDP relay is listening.
@@ -280,7 +281,20 @@ public class UdpRelay : IDisposable, IAsyncDisposable
         // Resolve and cache
         var addresses = await Dns.GetHostAddressesAsync(domain, cancellationToken).ConfigureAwait(false);
         _dnsCache[domain] = (addresses, DateTime.UtcNow.Add(DnsCacheTtl));
-        
+
+        // Evict expired entries if cache exceeds threshold
+        if (_dnsCache.Count > DnsCacheMaxSize)
+        {
+            var now = DateTime.UtcNow;
+            foreach (var key in _dnsCache.Keys)
+            {
+                if (_dnsCache.TryGetValue(key, out var entry) && entry.Expiry < now)
+                {
+                    _dnsCache.TryRemove(key, out _);
+                }
+            }
+        }
+
         return addresses;
     }
 
@@ -360,7 +374,7 @@ public class UdpRelay : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task StopAsync()
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposed) != 0) return;
 
         _cancellationTokenSource.Cancel();
         
@@ -394,9 +408,7 @@ public class UdpRelay : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        
-        _disposed = true;
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
         
         await StopAsync().ConfigureAwait(false);
         _cancellationTokenSource.Dispose();
@@ -409,9 +421,7 @@ public class UdpRelay : IDisposable, IAsyncDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        
-        _disposed = true;
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
         _cancellationTokenSource.Cancel();
         
         // Dispose UDP client first to unblock ReceiveAsync

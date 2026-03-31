@@ -1,6 +1,7 @@
 {
   "ListenIPAddress": "127.0.0.1",
   "ListenPort": 1080,
+  "MaxConnections": 1000,
   "IPAddressMappings": [
     {
       "IPAddress": "127.0.0.1",

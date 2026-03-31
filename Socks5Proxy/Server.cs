@@ -20,8 +20,9 @@ public class Server : IDisposable, IAsyncDisposable
     private readonly FriendlyNameResolver _resolver;
     private TcpListener? _listener;
     private readonly ConcurrentDictionary<int, ConnectionHandler> _activeConnections;
+    private readonly ConcurrentDictionary<int, Task> _connectionTasks;
     private int _connectionIdCounter;
-    private bool _disposed;
+    private int _disposed;
 
     /// <summary>
     /// Initializes a new instance of the Server class.
@@ -35,6 +36,7 @@ public class Server : IDisposable, IAsyncDisposable
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
         _activeConnections = new ConcurrentDictionary<int, ConnectionHandler>();
+        _connectionTasks = new ConcurrentDictionary<int, Task>();
 
         // Validate configuration
         if (!_config.IsValid(out string errorMessage))
@@ -91,19 +93,26 @@ public class Server : IDisposable, IAsyncDisposable
             {
                 try
                 {
-                    var tcpClient = await AcceptClientAsync(_listener, cancellationToken).ConfigureAwait(false);
-                    
-                    if (tcpClient != null)
+                    // Check max connection limit
+                    if (_config.MaxConnections > 0 && _activeConnections.Count >= _config.MaxConnections)
                     {
-                        // Handle client connection in background task
-                        _ = Task.Run(async () => await HandleClientConnectionAsync(tcpClient, cancellationToken).ConfigureAwait(false), 
-                                   cancellationToken);
+                        _logger.Warning("Max connections ({MaxConnections}) reached, waiting before accepting new connections", _config.MaxConnections);
+                        await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+                        continue;
                     }
-                    else
-                    {
-                        // AcceptClientAsync returned null, likely due to cancellation
-                        break;
-                    }
+
+                    var tcpClient = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+
+                    // Handle client connection in background task
+                    var connectionId = Interlocked.Increment(ref _connectionIdCounter);
+                    var task = Task.Run(async () => await HandleClientConnectionAsync(tcpClient, connectionId, cancellationToken).ConfigureAwait(false),
+                                       CancellationToken.None);
+                    _connectionTasks[connectionId] = task;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Cancellation requested, exit gracefully
+                    break;
                 }
                 catch (ObjectDisposedException)
                 {
@@ -149,78 +158,17 @@ public class Server : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Accepts a client connection with cancellation support.
-    /// </summary>
-    /// <param name="listener">The TCP listener.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>The accepted TCP client or null if cancelled.</returns>
-    private static async Task<TcpClient?> AcceptClientAsync(TcpListener listener, CancellationToken cancellationToken)
-    {
-        try
-        {
-            // Create a task completion source that will be completed when cancellation is requested
-            var tcs = new TaskCompletionSource<TcpClient>();
-            
-            // Register cancellation callback to cancel the task completion source
-            using var registration = cancellationToken.Register(() => tcs.TrySetCanceled());
-            
-            // Start accepting the connection
-            var acceptTask = listener.AcceptTcpClientAsync();
-            
-            // Wait for either the accept task to complete or cancellation
-            var completedTask = await Task.WhenAny(acceptTask, tcs.Task).ConfigureAwait(false);
-            
-            if (completedTask == acceptTask)
-            {
-                return await acceptTask.ConfigureAwait(false);
-            }
-            else
-            {
-                // Cancellation was requested - handle orphaned accept task
-                // The acceptTask may still complete and return a TcpClient that needs to be disposed
-                _ = acceptTask.ContinueWith(t =>
-                {
-                    if (t.IsCompletedSuccessfully)
-                    {
-                        try
-                        {
-                            t.Result?.Dispose();
-                        }
-                        catch
-                        {
-                            // Ignore disposal errors during shutdown
-                        }
-                    }
-                }, TaskContinuationOptions.OnlyOnRanToCompletion);
-                return null;
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            return null;
-        }
-        catch (ObjectDisposedException)
-        {
-            return null;
-        }
-        catch (InvalidOperationException)
-        {
-            return null;
-        }
-    }
-
-    /// <summary>
     /// Handles an individual client connection.
     /// </summary>
     /// <param name="tcpClient">The connected TCP client.</param>
+    /// <param name="connectionId">The unique connection identifier.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    private async Task HandleClientConnectionAsync(TcpClient tcpClient, CancellationToken cancellationToken)
+    private async Task HandleClientConnectionAsync(TcpClient tcpClient, int connectionId, CancellationToken cancellationToken)
     {
         var clientEndPointObj = tcpClient.Client.RemoteEndPoint;
         var clientEndPoint = clientEndPointObj?.ToString() ?? "Unknown";
         var friendlyClientSuffix = _resolver.FriendlySuffix(clientEndPointObj);
         ConnectionHandler? handler = null;
-        var connectionId = Interlocked.Increment(ref _connectionIdCounter);
 
         try
         {
@@ -270,6 +218,9 @@ public class Server : IDisposable, IAsyncDisposable
                     _activeConnections.Count);
             }
 
+            // Remove task tracking entry
+            _connectionTasks.TryRemove(connectionId, out _);
+
             // Ensure client is properly closed
             try
             {
@@ -287,7 +238,7 @@ public class Server : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task StopAsync()
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed) != 0)
             return;
 
         try
@@ -295,35 +246,21 @@ public class Server : IDisposable, IAsyncDisposable
             // Stop accepting new connections
             _listener?.Stop();
 
-            // Close all active connections - snapshot and clear using ConcurrentDictionary
-            var connectionsToClose = _activeConnections.Values.ToList();
-            _activeConnections.Clear();
+            // Wait for active connection tasks to complete (they clean up after themselves)
+            var tasks = _connectionTasks.Values.ToArray();
+            _logger.Information("Waiting for {Count} active connections to finish", tasks.Length);
 
-            _logger.Information("Closing {Count} active connections", connectionsToClose.Count);
-
-            // Dispose all connection handlers
-            var disposeTasks = connectionsToClose.Select(handler =>
-                Task.Run(() =>
-                {
-                    try
-                    {
-                        handler.Dispose();
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Error(ex, "Error disposing connection handler during server shutdown");
-                    }
-                }));
-
-            // Wait for all connections to close with timeout
-            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
-            var disposeTask = Task.WhenAll(disposeTasks);
-            
-            await Task.WhenAny(disposeTask, timeoutTask).ConfigureAwait(false);
-
-            if (!disposeTask.IsCompleted)
+            try
+            {
+                await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
             {
                 _logger.Warning("Some connections did not close gracefully within timeout");
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning(ex, "Error while waiting for connections to close");
             }
         }
         catch (Exception ex)
@@ -342,10 +279,8 @@ public class Server : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return;
-
-        _disposed = true;
 
         try
         {
@@ -364,10 +299,8 @@ public class Server : IDisposable, IAsyncDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
             return;
-
-        _disposed = true;
 
         try
         {

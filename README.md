@@ -39,13 +39,15 @@ The server looks for configuration in the following order:
 ```json
 {
   "ListenIPAddress": "127.0.0.1",
-  "ListenPort": 1080
+  "ListenPort": 1080,
+  "MaxConnections": 1000
 }
 ```
 
 **Configuration Options:**
 - `ListenIPAddress`: IP address to bind the proxy server (default: 127.0.0.1)
 - `ListenPort`: Port number to listen on (default: 1080)
+- `MaxConnections`: Maximum number of concurrent connections, or `0` for unlimited (default: 1000)
 
 ### Logging Configuration (`appsettings.json`)
 
@@ -114,6 +116,7 @@ The application consists of several key components:
 ### Supported Features
 - SOCKS5 protocol (RFC 1928)
 - TCP CONNECT command
+- UDP ASSOCIATE command
 - IPv4 addresses
 - IPv6 addresses
 - Domain name resolution
@@ -121,7 +124,6 @@ The application consists of several key components:
 
 ### Currently Not Supported
 - SOCKS4/SOCKS4a protocols
-- UDP ASSOCIATE command
 - BIND command
 - Username/password authentication
 - GSSAPI authentication

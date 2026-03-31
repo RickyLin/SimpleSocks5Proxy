@@ -27,6 +27,12 @@ public class ProxyConfiguration
     public List<IPAddressMapping> IPAddressMappings { get; set; } = new();
 
     /// <summary>
+    /// Maximum number of concurrent connections. 0 means unlimited. Default: 1000.
+    /// </summary>
+    [Range(0, int.MaxValue, ErrorMessage = "MaxConnections must be 0 (unlimited) or a positive number")]
+    public int MaxConnections { get; set; } = 1000;
+
+    /// <summary>
     /// Validates that the IP address is valid.
     /// </summary>
     /// <returns>True if the configuration is valid, otherwise false.</returns>
