@@ -1,7 +1,6 @@
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -173,10 +172,8 @@ public class UdpRelay : IDisposable, IAsyncDisposable
             {
                 case Socks5Protocol.AddressType.IPv4:
                     if (buffer.Length < offset + 6) return; // 4 bytes IP + 2 bytes port
-                    var ipv4Bytes = new byte[4];
-                    Array.Copy(buffer, offset, ipv4Bytes, 0, 4);
+                    var ipv4Address = new IPAddress(buffer.AsSpan(offset, 4));
                     offset += 4;
-                    var ipv4Address = new IPAddress(ipv4Bytes);
                     var port = (buffer[offset] << 8) | buffer[offset + 1];
                     offset += 2;
                     destinationEndPoint = new IPEndPoint(ipv4Address, port);
@@ -184,10 +181,8 @@ public class UdpRelay : IDisposable, IAsyncDisposable
 
                 case Socks5Protocol.AddressType.IPv6:
                     if (buffer.Length < offset + 18) return; // 16 bytes IP + 2 bytes port
-                    var ipv6Bytes = new byte[16];
-                    Array.Copy(buffer, offset, ipv6Bytes, 0, 16);
+                    var ipv6Address = new IPAddress(buffer.AsSpan(offset, 16));
                     offset += 16;
-                    var ipv6Address = new IPAddress(ipv6Bytes);
                     port = (buffer[offset] << 8) | buffer[offset + 1];
                     offset += 2;
                     destinationEndPoint = new IPEndPoint(ipv6Address, port);
@@ -197,10 +192,8 @@ public class UdpRelay : IDisposable, IAsyncDisposable
                     if (buffer.Length < offset + 1) return;
                     byte domainLength = buffer[offset++];
                     if (buffer.Length < offset + domainLength + 2) return;
-                    var domainBytes = new byte[domainLength];
-                    Array.Copy(buffer, offset, domainBytes, 0, domainLength);
+                    var domain = System.Text.Encoding.ASCII.GetString(buffer, offset, domainLength);
                     offset += domainLength;
-                    var domain = System.Text.Encoding.ASCII.GetString(domainBytes);
                     port = (buffer[offset] << 8) | buffer[offset + 1];
                     offset += 2;
                     
@@ -208,8 +201,18 @@ public class UdpRelay : IDisposable, IAsyncDisposable
                     try
                     {
                         var addresses = await ResolveDnsWithCacheAsync(domain, cancellationToken).ConfigureAwait(false);
-                        var targetAddress = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork) 
-                                          ?? addresses.FirstOrDefault();
+                        IPAddress? targetAddress = null;
+                        foreach (var candidate in addresses)
+                        {
+                            if (candidate.AddressFamily == AddressFamily.InterNetwork)
+                            {
+                                targetAddress = candidate;
+                                break;
+                            }
+
+                            targetAddress ??= candidate;
+                        }
+
                         if (targetAddress != null)
                         {
                             destinationEndPoint = new IPEndPoint(targetAddress, port);
@@ -328,16 +331,14 @@ public class UdpRelay : IDisposable, IAsyncDisposable
             if (sourceEndPoint.AddressFamily == AddressFamily.InterNetwork)
             {
                 responseBuffer[offset++] = Socks5Protocol.AddressType.IPv4;
-                var addressBytes = sourceEndPoint.Address.GetAddressBytes();
-                Array.Copy(addressBytes, 0, responseBuffer, offset, 4);
-                offset += 4;
+                sourceEndPoint.Address.TryWriteBytes(responseBuffer.AsSpan(offset, 4), out var bytesWritten);
+                offset += bytesWritten;
             }
             else if (sourceEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
             {
                 responseBuffer[offset++] = Socks5Protocol.AddressType.IPv6;
-                var addressBytes = sourceEndPoint.Address.GetAddressBytes();
-                Array.Copy(addressBytes, 0, responseBuffer, offset, 16);
-                offset += 16;
+                sourceEndPoint.Address.TryWriteBytes(responseBuffer.AsSpan(offset, 16), out var bytesWritten);
+                offset += bytesWritten;
             }
 
             // Port (2 bytes)
@@ -345,7 +346,7 @@ public class UdpRelay : IDisposable, IAsyncDisposable
             responseBuffer[offset++] = (byte)(sourceEndPoint.Port & 0xFF);
 
             // Payload
-            Array.Copy(buffer, 0, responseBuffer, offset, buffer.Length);
+            buffer.AsSpan().CopyTo(responseBuffer.AsSpan(offset));
             var totalLength = offset + buffer.Length;
 
             // Send back to client using Memory<byte>

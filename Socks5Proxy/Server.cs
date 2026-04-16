@@ -18,10 +18,13 @@ public class Server : IDisposable, IAsyncDisposable
     private readonly ProxyConfiguration _config;
     private readonly ILogger _logger;
     private readonly FriendlyNameResolver _resolver;
+    private readonly SemaphoreSlim? _connectionSlots;
+    private readonly CancellationTokenSource _shutdownTokenSource;
     private TcpListener? _listener;
     private readonly ConcurrentDictionary<int, ConnectionHandler> _activeConnections;
     private readonly ConcurrentDictionary<int, Task> _connectionTasks;
     private int _connectionIdCounter;
+    private int _stopped;
     private int _disposed;
 
     /// <summary>
@@ -35,6 +38,10 @@ public class Server : IDisposable, IAsyncDisposable
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _connectionSlots = _config.MaxConnections > 0
+            ? new SemaphoreSlim(_config.MaxConnections, _config.MaxConnections)
+            : null;
+        _shutdownTokenSource = new CancellationTokenSource();
         _activeConnections = new ConcurrentDictionary<int, ConnectionHandler>();
         _connectionTasks = new ConcurrentDictionary<int, Task>();
 
@@ -61,6 +68,9 @@ public class Server : IDisposable, IAsyncDisposable
     {
         try
         {
+            using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownTokenSource.Token);
+            var serverCancellationToken = linkedCancellationTokenSource.Token;
+
             if (!IPAddress.TryParse(_config.ListenIPAddress, out var listenAddress))
             {
                 throw new InvalidOperationException($"Invalid IP address: {_config.ListenIPAddress}");
@@ -76,7 +86,7 @@ public class Server : IDisposable, IAsyncDisposable
                 _resolver.FriendlySuffix(localEndPoint));
 
             // Register cancellation callback to stop the listener
-            using var registration = cancellationToken.Register(() =>
+            using var registration = serverCancellationToken.Register(() =>
             {
                 try
                 {
@@ -89,54 +99,80 @@ public class Server : IDisposable, IAsyncDisposable
             });
 
             // Accept connections loop
-            while (!cancellationToken.IsCancellationRequested)
+            while (!serverCancellationToken.IsCancellationRequested)
             {
+                var slotReserved = false;
+
                 try
                 {
-                    // Check max connection limit
-                    if (_config.MaxConnections > 0 && _activeConnections.Count >= _config.MaxConnections)
+                    if (_connectionSlots != null)
                     {
-                        _logger.Warning("Max connections ({MaxConnections}) reached, waiting before accepting new connections", _config.MaxConnections);
-                        await Task.Delay(500, cancellationToken).ConfigureAwait(false);
-                        continue;
+                        await _connectionSlots.WaitAsync(serverCancellationToken).ConfigureAwait(false);
+                        slotReserved = true;
                     }
 
-                    var tcpClient = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+                    var tcpClient = await _listener.AcceptTcpClientAsync(serverCancellationToken).ConfigureAwait(false);
 
                     // Handle client connection in background task
                     var connectionId = Interlocked.Increment(ref _connectionIdCounter);
-                    var task = Task.Run(async () => await HandleClientConnectionAsync(tcpClient, connectionId, cancellationToken).ConfigureAwait(false),
+                    var task = Task.Run(async () => await HandleClientConnectionAsync(tcpClient, connectionId, serverCancellationToken).ConfigureAwait(false),
                                        CancellationToken.None);
                     _connectionTasks[connectionId] = task;
+                    slotReserved = false;
                 }
                 catch (OperationCanceledException)
                 {
+                    if (slotReserved)
+                    {
+                        ReleaseConnectionSlot();
+                    }
+
                     // Cancellation requested, exit gracefully
                     break;
                 }
                 catch (ObjectDisposedException)
                 {
+                    if (slotReserved)
+                    {
+                        ReleaseConnectionSlot();
+                    }
+
                     // Listener has been disposed, exit gracefully
                     break;
                 }
                 catch (InvalidOperationException)
                 {
+                    if (slotReserved)
+                    {
+                        ReleaseConnectionSlot();
+                    }
+
                     // Listener is not started or has been stopped
                     break;
                 }
                 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.Interrupted)
                 {
+                    if (slotReserved)
+                    {
+                        ReleaseConnectionSlot();
+                    }
+
                     // Server was stopped, exit gracefully
                     break;
                 }
                 catch (Exception ex)
                 {
+                    if (slotReserved)
+                    {
+                        ReleaseConnectionSlot();
+                    }
+
                     _logger.Error(ex, "Error accepting client connection");
                     
                     // Brief delay to prevent tight loop on persistent errors
                     try
                     {
-                        await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
+                        await Task.Delay(1000, serverCancellationToken).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
                     {
@@ -218,6 +254,11 @@ public class Server : IDisposable, IAsyncDisposable
                     _activeConnections.Count);
             }
 
+            if (_connectionSlots != null)
+            {
+                ReleaseConnectionSlot();
+            }
+
             // Remove task tracking entry
             _connectionTasks.TryRemove(connectionId, out _);
 
@@ -238,11 +279,13 @@ public class Server : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task StopAsync()
     {
-        if (Volatile.Read(ref _disposed) != 0)
+        if (Interlocked.CompareExchange(ref _stopped, 1, 0) != 0)
             return;
 
         try
         {
+            _shutdownTokenSource.Cancel();
+
             // Stop accepting new connections
             _listener?.Stop();
 
@@ -274,6 +317,18 @@ public class Server : IDisposable, IAsyncDisposable
     /// </summary>
     public int ActiveConnectionCount => _activeConnections.Count;
 
+    private void ReleaseConnectionSlot()
+    {
+        try
+        {
+            _connectionSlots?.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Late connection cleanup can race with server disposal.
+        }
+    }
+
     /// <summary>
     /// Asynchronously disposes the server and all its resources.
     /// </summary>
@@ -289,6 +344,11 @@ public class Server : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             _logger.Error(ex, "Error during async disposal");
+        }
+        finally
+        {
+            _connectionSlots?.Dispose();
+            _shutdownTokenSource.Dispose();
         }
 
         GC.SuppressFinalize(this);
@@ -310,6 +370,11 @@ public class Server : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             _logger.Error(ex, "Error during disposal");
+        }
+        finally
+        {
+            _connectionSlots?.Dispose();
+            _shutdownTokenSource.Dispose();
         }
 
         GC.SuppressFinalize(this);

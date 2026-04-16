@@ -363,6 +363,7 @@ public class ConnectionHandler : IDisposable, IAsyncDisposable
                 friendlyClientSuffixForConnect);
 
             _destinationClient = new TcpClient();
+            _destinationClient.NoDelay = true;
             
             try
             {
